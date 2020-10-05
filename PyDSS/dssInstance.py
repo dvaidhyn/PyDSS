@@ -1,7 +1,6 @@
 from PyDSS.ResultContainer import ResultContainer as RC
 from PyDSS.ResultData import ResultData
 from PyDSS.pyContrReader import pyContrReader as pcr
-from PyDSS.pyContrReader import read_controller_settings_from_registry
 from PyDSS.pyPlotReader import pyPlotReader as ppr
 from PyDSS.dssElementFactory import create_dss_element
 from PyDSS.dssCircuit import dssCircuit
@@ -10,18 +9,16 @@ from PyDSS.dssBus import dssBus
 from PyDSS import SolveMode
 from PyDSS import pyLogger
 from PyDSS import helics_interface as HI
-from PyDSS.utils.dataframe_utils import write_dataframe
 from PyDSS.utils.utils import make_human_readable_size
-
+from PyDSS.ProfileManager.ProfileStore import ProfileManager
 from PyDSS.exceptions import InvalidParameter, InvalidConfiguration
 
 from PyDSS.pyPostprocessor import pyPostprocess
 import PyDSS.pyControllers as pyControllers
 import PyDSS.pyPlots as pyPlots
-
 import numpy as np
-import pandas as pd
 import logging
+import json
 import time
 import os
 
@@ -29,15 +26,16 @@ from bokeh.plotting import curdoc
 from bokeh.layouts import row
 from bokeh.client import push_session
 from opendssdirect.utils import run_command
-import opendssdirect as dss
-
 
 CONTROLLER_PRIORITIES = 3
 
 class OpenDSS:
-    def __init__(self, params):
-        self._TempResultList = []
+    def __init__(self):
+        import opendssdirect as dss
         self._dssInstance = dss
+
+    def init(self, params):
+        self._TempResultList = []
         self._dssBuses = {}
         self._dssObjects = {}
         self._dssObjectsByClass = {}
@@ -59,7 +57,9 @@ class OpenDSS:
             'Export': os.path.join(rootPath, params['Project']['Active Project'], 'Exports'),
             'Log': os.path.join(rootPath, params['Project']['Active Project'], 'Logs'),
             'dssFiles': os.path.join(rootPath, params['Project']['Active Project'], 'DSSfiles'),
-            'dssFilePath': os.path.join(rootPath, params['Project']['Active Project'], 'DSSfiles', params['Project']['DSS File']),
+            'dssFilePath': os.path.join(
+                rootPath, params['Project']['Active Project'], 'DSSfiles', params['Project']['DSS File']
+            ),
         }
 
         if params['Project']['DSS File Absolute Path']:
@@ -71,19 +71,21 @@ class OpenDSS:
                 'DSSfiles',
                 params['Project']['DSS File']
             )
-
+        LoggerTag = pyLogger.getLoggerTag(params)
         if params["Logging"]["Pre-configured logging"]:
             self._Logger = logging.getLogger(__name__)
         else:
-            LoggerTag = pyLogger.getLoggerTag(params)
             self._Logger = pyLogger.getLogger(LoggerTag, self._dssPath['Log'], LoggerOptions=params["Logging"])
-        self._Logger.info('An instance of OpenDSS version ' + dss.__version__ + ' has been created.')
+        self._reportsLogger = pyLogger.getReportLogger(LoggerTag, self._dssPath['Log'], LoggerOptions=params["Logging"])
+
+        self._Logger.info('An instance of OpenDSS version ' + self._dssInstance.__version__ + ' has been created.')
 
         for key, path in self._dssPath.items():
             assert (os.path.exists(path)), '{} path: {} does not exist!'.format(key, path)
 
         self._dssInstance.Basic.ClearAll()
         self._dssInstance.utils.run_command('Log=NO')
+
         run_command('Clear')
         self._Logger.info('Loading OpenDSS model')
         try:
@@ -97,38 +99,47 @@ class OpenDSS:
         run_command('Set DefaultBaseFrequency={}'.format(params['Frequency']['Fundamental frequency']))
         self._Logger.info('OpenDSS fundamental frequency set to :  ' + str(params['Frequency']['Fundamental frequency']) + ' Hz')
 
-        run_command('Set %SeriesRL={}'.format(params['Frequency']['Percentage load in series']))
+        # try:
+        #     run_command('Set %SeriesRL={}'.format(params['Frequency']['Percentage load in series']))
+        # except Exception as e:
+        #     print("Eception at adding seriesRL ",e, flush=True)
+
+
         if params['Frequency']['Neglect shunt admittance']:
             run_command('Set NeglectLoadY=Yes')
 
-        self._dssCircuit = dss.Circuit
-        self._dssElement = dss.Element
-        self._dssBus = dss.Bus
-        self._dssClass = dss.ActiveClass
+        self._dssCircuit = self._dssInstance.Circuit
+        self._dssElement = self._dssInstance.Element
+        self._dssBus = self._dssInstance.Bus
+        self._dssClass = self._dssInstance.ActiveClass
         self._dssCommand = run_command
-        self._dssSolution = dss.Solution
+        self._dssSolution = self._dssInstance.Solution
         self._dssSolver = SolveMode.GetSolver(SimulationSettings=params, dssInstance=self._dssInstance)
 
-        self._Modifier = Modifier(dss, run_command, params)
+        self._Modifier = Modifier(self._dssInstance, run_command, params)
         self._UpdateDictionary()
         self._CreateBusObjects()
         self._dssSolver.reSolve()
 
-        if params and params['Exports']['Log Results']:
-            if params['Exports']['Result Container'] == 'ResultContainer':
-                self.ResultContainer = RC(params, self._dssPath,  self._dssObjects, self._dssObjectsByClass,
-                                          self._dssBuses, self._dssSolver, self._dssCommand)
-            else:
-                self.ResultContainer = ResultData(params, self._dssPath,  self._dssObjects, self._dssObjectsByClass,
-                                                    self._dssBuses, self._dssSolver, self._dssCommand, self._dssInstance)
-        else:
-            self.ResultContainer = None
+        if params['Profiles']["Use profile manager"]:
+            #TODO: disable internal profiles
+            self._Logger.info('Disabling internal yearly and duty-cycle profiles.')
+            for m in ["Loads", "PVSystem", "Generator", "Storage"]:
+                run_command(f'BatchEdit {m}..* yearly=NONE duty=None')
+            self.profileStore = ProfileManager(self._dssObjects, self._dssSolver, params)
+            self.profileStore.setup_profiles()
 
-        if params['Project']['Use Controller Registry']:
-            ControllerList = read_controller_settings_from_registry(self._dssPath['pyControllers'])
-        else:
-            pyCtrlReader = pcr(self._dssPath['pyControllers'])
-            ControllerList = pyCtrlReader.pyControllers
+
+        #if params and params['Exports']['Log Results']:
+        if params['Exports']['Result Container'] == 'ResultContainer':
+            self.ResultContainer = RC(params, self._dssPath,  self._dssObjects, self._dssObjectsByClass,
+                                      self._dssBuses, self._dssSolver, self._dssCommand)
+        elif params['Exports']['Result Container'] == 'ResultData':
+            self.ResultContainer = ResultData(params, self._dssPath,  self._dssObjects, self._dssObjectsByClass,
+                                                self._dssBuses, self._dssSolver, self._dssCommand, self._dssInstance)
+
+        pyCtrlReader = pcr(self._dssPath['pyControllers'])
+        ControllerList = pyCtrlReader.pyControllers
 
         if ControllerList is not None:
             self._CreateControllers(ControllerList)
@@ -147,16 +158,6 @@ class OpenDSS:
             self._HI = HI.helics_interface(self._dssSolver, self._dssObjects, self._dssObjectsByClass, params,
                                            self._dssPath)
         return
-
-    def _ReadControllerDefinitions(self):
-        controllers = None
-        mappings = os.path.join(os.path.dirname(self._dssPath['pyControllers']), "ControllerMappings")
-        if os.path.exists(mappings):
-            ctrl_mapping_files = os.listdir(self._dssPath["ControllerMappings"])
-            for filename in ctrl_mapping_files: 
-                data = load_data(os.path.join(self._dssPath["ControllerMappings"], filename))
-
-        return controllers
 
     def _ModifyNetwork(self):
         # self._Modifier.Add_Elements('Storage', {'bus' : ['storagebus'], 'kWRated' : ['2000'], 'kWhRated'  : ['2000']},
@@ -231,14 +232,27 @@ class OpenDSS:
         self.session.show()
         return
 
-    def _UpdateControllers(self, Priority, Time, UpdateResults):
-        error = 0
-
+    def _UpdateControllers(self, Priority, Time, Iteration, UpdateResults):
+        errors = []
+        maxError = 0
         for controller in self._pyControls.values():
-            error += controller.Update(Priority, Time, UpdateResults)
+            error = controller.Update(Priority, Time, UpdateResults)
+            maxError = error if error > maxError else maxError
+            if Iteration == self._Options['Project']['Max Control Iterations'] - 1:
+                if error > self._Options['Project']['Error tolerance']:
+                    errorTag = {
+                            "Report": "Convergence",
+                            "Time": self._dssSolver.GetTotalSeconds(),
+                            "Controller": controller.Name(),
+                            "Controlled element": controller.ControlledElement(),
+                            "Error": error,
+                            "Control algorithm": controller.debugInfo()[Priority],
+                    }
+                    json_object = json.dumps(errorTag)
+                    self._reportsLogger.warning(json_object)
             if Priority == 0:
                 pass
-        return abs(error) < self._Options['Project']['Error tolerance'], error
+        return maxError < self._Options['Project']['Error tolerance'], maxError
 
     def _CreateBusObjects(self):
         BusNames = self._dssCircuit.AllBusNames()
@@ -272,6 +286,7 @@ class OpenDSS:
         self._dssObjectsByClass['Circuits'] = {
             'Circuit.' + self._dssCircuit.Name(): self._dssObjects['Circuit.' + self._dssCircuit.Name()]
         }
+        self._dssObjectsByClass['Buses'] = self._dssBuses
         return
 
     def _GetRelaventObjectDict(self, key):
@@ -286,27 +301,25 @@ class OpenDSS:
         return ObjectList
 
     def RunStep(self, step, updateObjects=None):
-        # updating paramters bebore simulation run
+        # updating parameters bebore simulation run
+        self._Logger.info(f'PyDSS datetime - {self._dssSolver.GetDateTime()}')
+        self._Logger.info(f'OpenDSS time [h] - {self._dssSolver.GetOpenDSSTime()}')
+        if self._Options['Profiles']["Use profile manager"]:
+            self.profileStore.update()
 
         if self._Options['Helics']['Co-simulation Mode']:
-            if self._increment_flag:
-                self._dssSolver.IncStep()
-            else:
-                self._dssSolver.reSolve()
             self._HI.updateHelicsSubscriptions()
         else:
-            self._dssSolver.IncStep()
             if updateObjects:
                 for object, params in updateObjects.items():
                     cl, name = object.split('.')
                     self._Modifier.Edit_Element(cl, name, params)
 
-
         # run simulation time step and get results
         if not self._Options['Project']['Disable PyDSS controllers']:
             for priority in range(CONTROLLER_PRIORITIES):
                 for i in range(self._Options['Project']['Max Control Iterations']):
-                    has_converged, error = self._UpdateControllers(priority, step, UpdateResults=False)
+                    has_converged, error = self._UpdateControllers(priority, step, i, UpdateResults=False)
                     self._Logger.debug('Control Loop {} convergence error: {}'.format(priority, error))
                     if has_converged or i == self._Options['Project']['Max Control Iterations'] - 1:
                         if not has_converged:
@@ -334,11 +347,19 @@ class OpenDSS:
                 self._dssSolver.setMode('Yearly')
 
         if self._Options['Helics']['Co-simulation Mode']:
+            if self._increment_flag:
+                self._dssSolver.IncStep()
+            else:
+                self._dssSolver.reSolve()
+        else:
+            self._dssSolver.IncStep()
+
+        if self._Options['Helics']['Co-simulation Mode']:
             self._HI.updateHelicsPublications()
             self._increment_flag, helics_time = self._HI.request_time_increment()
 
         if self.ResultContainer:
-            return self.ResultContainer.CurrentResults
+            return self.ResultContainer.GetCurrentData()
 
     def DryRunSimulation(self, project, scenario):
         """Run one time point for getting estimated space."""
@@ -361,7 +382,8 @@ class OpenDSS:
         Steps, sTime, eTime = self._dssSolver.SimulationSteps()
         self._Logger.info('Running simulation from {} till {}.'.format(sTime, eTime))
         self._Logger.info('Simulation time step {}.'.format(Steps))
-        if self._Options['Exports']['Result Container'] == 'ResultData' and self.ResultContainer is not None:
+        if self._Options['Exports']['Result Container'] == 'ResultData':
+            print("initializing store")
             self.ResultContainer.InitializeDataStore(project.hdf_store, Steps, MC_scenario_number)
 
         postprocessors = [
@@ -392,7 +414,7 @@ class OpenDSS:
                 for postprocessor in postprocessors:
                     step = postprocessor.run(step, Steps)
                 if self._increment_flag:
-                    step+=1
+                    step += 1
 
         finally:
             if self._Options and self._Options['Exports']['Log Results']:
@@ -423,10 +445,12 @@ class OpenDSS:
 
     def __del__(self):
         self._Logger.info('An instance of OpenDSS (' + str(self) + ') has been deleted.')
+        loggers = [self._Logger, self._reportsLogger]
         if self._Options["Logging"]["Log to external file"]:
-            handlers = list(self._Logger.handlers)
-            for filehandler in handlers:
-                filehandler.flush()
-                filehandler.close()
-                self._Logger.removeHandler(filehandler)
+            for L in loggers:
+                handlers = list(L.handlers)
+                for filehandler in handlers:
+                    filehandler.flush()
+                    filehandler.close()
+                    L.removeHandler(filehandler)
         return
